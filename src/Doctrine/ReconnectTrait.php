@@ -7,6 +7,7 @@ namespace ORMBundle\Doctrine;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception\ConnectionException;
+use Doctrine\DBAL\Exception\DriverException;
 use Doctrine\DBAL\Result;
 use ORMBundle\Backoff\BackoffFactoryInterface;
 use ORMBundle\DependencyInjection\DBAL\Configuration;
@@ -67,13 +68,28 @@ trait ReconnectTrait
             function () use ($action) {
                 try {
                     return $action();
-                } catch (ConnectionException $e) {
+                } catch (DriverException $e) {
+                    if (!$this->isConnectionLost($e)) {
+                        throw $e;
+                    }
+
                     $this->close();
 
                     throw $e;
                 }
             },
-            [ConnectionException::class],
+            [DriverException::class],
         );
+    }
+
+    private function isConnectionLost(DriverException $e): bool
+    {
+        if ($e instanceof ConnectionException) {
+            return true;
+        }
+
+        $previous = $e->getPrevious();
+
+        return null !== $previous && 7 === $previous->getCode();
     }
 }

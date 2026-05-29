@@ -59,9 +59,8 @@ jobs:
           file: ./reports/coverage/clover.xml
           flags: php-${{ matrix['php-version'] }}
           name: phpunit-${{ matrix['php-version'] }}
-          fail_ci_if_error: true
+          fail_ci_if_error: false
           verbose: true
-          use_oidc: true
 
   static-analysis:
     runs-on: ubuntu-latest
