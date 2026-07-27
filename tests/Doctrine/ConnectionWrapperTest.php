@@ -11,6 +11,7 @@ use Doctrine\DBAL\Exception\DriverException;
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 use ORMBundle\DependencyInjection\DBAL\Configuration;
 use ORMBundle\Doctrine\ConnectionWrapper;
+use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 
 class ConnectionWrapperTest extends TestCase
@@ -64,55 +65,80 @@ class ConnectionWrapperTest extends TestCase
         $result = $this->connection->reconnectIfFail(static function () use (&$callCount) {
             ++$callCount;
             if (1 === $callCount) {
-                $driverException = new Exception('Connection lost');
-
-                throw new ConnectionException($driverException, null);
+                throw new ConnectionException(new Exception('Connection lost', null, 7), null);
             }
 
             return 'success';
         });
 
         $this->assertSame('success', $result);
+        $this->assertSame(2, $callCount);
     }
 
     public function testReconnectIfFailRethrowsConnectionExceptionAfterMaxRetries(): void
     {
-        $callCount = 0;
-        $driverException = new Exception('Connection lost');
-
         $this->expectException(ConnectionException::class);
 
-        $this->connection->reconnectIfFail(static function () use ($driverException, &$callCount) {
-            ++$callCount;
-
-            throw new ConnectionException($driverException, null);
+        $this->connection->reconnectIfFail(static function () {
+            throw new ConnectionException(new Exception('Connection lost', null, 7), null);
         });
-
-        $this->assertSame(6, $callCount); // 1 initial attempt + 5 retries (default)
     }
 
     public function testReconnectIfFailWithNonConnectionExceptionRethrows(): void
     {
-        $exception = new \RuntimeException('Non-connection error');
-
         $this->expectException(\RuntimeException::class);
 
-        $this->connection->reconnectIfFail(static function () use ($exception) {
-            throw $exception;
+        $this->connection->reconnectIfFail(static function () {
+            throw new \RuntimeException('Non-connection error');
         });
     }
 
-    public function testReconnectIfFailDoesNotRetryPlainDriverExceptionWithCode7(): void
+    /**
+     * A dropped connection is often reported by PostgreSQL as a bare DriverException
+     * (no SQLSTATE / 'HY000', PDO code 7) that DBAL does NOT convert to ConnectionException.
+     * It must still trigger reconnect + retry, otherwise a dead connection stays in the
+     * pool and e.g. a worker keeps failing every message after the DB recovers.
+     */
+    public function testReconnectIfFailRetriesOnBareDriverExceptionConnectionLoss(): void
     {
-        // Every fatal PostgreSQL error carries driver code 7 (PGRES_FATAL_ERROR).
-        // A bare DriverException (not classified as ConnectionException by DBAL) is
-        // deterministic and must be surfaced immediately, without retrying.
+        $callCount = 0;
+        $result = $this->connection->reconnectIfFail(static function () use (&$callCount) {
+            ++$callCount;
+            if (1 === $callCount) {
+                $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
+
+                throw new DriverException($pdoException, null);
+            }
+
+            return 'success';
+        });
+
+        $this->assertSame('success', $result);
+        $this->assertSame(2, $callCount);
+    }
+
+    public function testReconnectIfFailNormalizesBareConnectionLossAfterMaxRetries(): void
+    {
+        // A persistent bare connection loss is normalized to ConnectionException.
+        $this->expectException(ConnectionException::class);
+
+        $this->connection->reconnectIfFail(static function () {
+            $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
+
+            throw new DriverException($pdoException, null);
+        });
+    }
+
+    public function testReconnectIfFailDoesNotRetryDeterministicDriverException(): void
+    {
+        // Deterministic errors carry a specific SQLSTATE (here 42P01) and must be
+        // surfaced immediately, without reconnecting or retrying.
         $callCount = 0;
 
         try {
             $this->connection->reconnectIfFail(static function () use (&$callCount) {
                 ++$callCount;
-                $pdoException = new Exception('SQLSTATE[42703]: Undefined column: 7 ERROR', null, 7);
+                $pdoException = new Exception('Undefined table', '42P01', 7);
 
                 throw new DriverException($pdoException, null);
             });
@@ -124,20 +150,16 @@ class ConnectionWrapperTest extends TestCase
 
     public function testReconnectIfFailDoesNotRetryUniqueConstraintViolation(): void
     {
-        // Regression: a unique-constraint violation (driver code 7) previously
-        // triggered a bogus reconnect+retry, which closed the connection, rolled back
-        // the running migration transaction and re-ran the failing statement against a
+        // Regression: a unique-constraint violation (SQLSTATE 23505, PDO code 7) previously
+        // triggered a bogus reconnect+retry, which closed the connection, rolled back the
+        // running migration transaction and re-ran the failing statement against a
         // half-reverted schema, masking the real error with a misleading one.
         $callCount = 0;
 
         try {
             $this->connection->reconnectIfFail(static function () use (&$callCount) {
                 ++$callCount;
-                $pdoException = new Exception(
-                    'SQLSTATE[23505]: Unique violation: 7 ERROR: could not create unique index',
-                    null,
-                    7,
-                );
+                $pdoException = new Exception('could not create unique index', '23505', 7);
 
                 throw new UniqueConstraintViolationException($pdoException, null);
             });
@@ -147,34 +169,31 @@ class ConnectionWrapperTest extends TestCase
         }
     }
 
-    public function testReconnectIfFailDoesNotRetryDriverExceptionWithNonConnectionCode(): void
+    public function testClosesConnectionOnBareDriverExceptionConnectionLoss(): void
     {
+        $connection = $this->createConnectionMockWithCloseSpy();
+
+        $connection->expects($this->once())
+            ->method('close')
+        ;
+
         $callCount = 0;
 
-        try {
-            $this->connection->reconnectIfFail(static function () use (&$callCount) {
-                ++$callCount;
-                $pdoException = new Exception('SQLSTATE[42P01]: Undefined table', null, 0);
+        $connection->reconnectIfFail(static function () use (&$callCount) {
+            ++$callCount;
+            if (1 === $callCount) {
+                $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
 
                 throw new DriverException($pdoException, null);
-            });
-            $this->fail('Expected DriverException was not thrown');
-        } catch (DriverException $e) {
-            $this->assertSame(1, $callCount);
-        }
+            }
+
+            return 'success';
+        });
     }
 
-    public function testDoesNotCloseConnectionOnPlainDriverExceptionWithCode7(): void
+    public function testDoesNotCloseConnectionOnDeterministicError(): void
     {
-        $params = ['driver' => 'pdo_sqlite', 'memory' => true];
-        $config = new Configuration();
-        $driver = DriverManager::getConnection($params, $config)->getDriver();
-
-        $connection = $this->getMockBuilder(ConnectionWrapper::class)
-            ->setConstructorArgs([$params, $driver, $config])
-            ->onlyMethods(['close'])
-            ->getMock()
-        ;
+        $connection = $this->createConnectionMockWithCloseSpy();
 
         $connection->expects($this->never())
             ->method('close')
@@ -182,71 +201,68 @@ class ConnectionWrapperTest extends TestCase
 
         try {
             $connection->reconnectIfFail(static function () {
-                $pdoException = new Exception('SQLSTATE[23505]: Unique violation: 7 ERROR', null, 7);
+                $pdoException = new Exception('could not create unique index', '23505', 7);
 
-                throw new DriverException($pdoException, null);
+                throw new UniqueConstraintViolationException($pdoException, null);
             });
-            $this->fail('Expected DriverException was not thrown');
-        } catch (DriverException $e) {
-            // expected: no reconnect for a deterministic driver error
+            $this->fail('Expected UniqueConstraintViolationException was not thrown');
+        } catch (UniqueConstraintViolationException $e) {
+            // expected: no reconnect for a deterministic error
         }
-    }
-
-    public function testUsesCustomRetryOptions(): void
-    {
-        $params = [
-            'driver' => 'pdo_sqlite',
-            'memory' => true,
-            'driverOptions' => [
-                'backoff_options' => [
-                    'max_attempts' => 3,
-                ],
-            ],
-        ];
-        $config = new Configuration();
-        $driver = DriverManager::getConnection($params, $config)->getDriver();
-        $connection = new ConnectionWrapper($params, $driver, $config);
-
-        $callCount = 0;
-        $driverException = new Exception('Connection lost');
-
-        $this->expectException(ConnectionException::class);
-
-        $connection->reconnectIfFail(static function () use ($driverException, &$callCount) {
-            ++$callCount;
-
-            throw new ConnectionException($driverException, null);
-        });
-
-        $this->assertSame(3, $callCount); // Custom max_attempts
     }
 
     public function testClosesConnectionOnConnectionException(): void
     {
-        $params = ['driver' => 'pdo_sqlite', 'memory' => true];
-        $config = new Configuration();
-        $driver = DriverManager::getConnection($params, $config)->getDriver();
-
-        $connection = $this->getMockBuilder(ConnectionWrapper::class)
-            ->setConstructorArgs([$params, $driver, $config])
-            ->onlyMethods(['close'])
-            ->getMock()
-        ;
+        $connection = $this->createConnectionMockWithCloseSpy();
 
         $connection->expects($this->once())
             ->method('close')
         ;
 
         $callCount = 0;
-        $driverException = new Exception('Connection lost');
 
-        $connection->reconnectIfFail(static function () use (&$callCount, $driverException) {
+        $connection->reconnectIfFail(static function () use (&$callCount) {
             ++$callCount;
             if (1 === $callCount) {
-                throw new ConnectionException($driverException, null);
+                throw new ConnectionException(new Exception('Connection lost', null, 7), null);
             }
 
             return 'success';
         });
+    }
+
+    public function testUsesCustomRetryOptions(): void
+    {
+        $params = ['driver' => 'pdo_sqlite', 'memory' => true];
+        $config = new Configuration();
+        $config->setBackoffOptions(['max_retries' => 3]);
+        $driver = DriverManager::getConnection($params, $config)->getDriver();
+        $connection = new ConnectionWrapper($params, $driver, $config);
+
+        $callCount = 0;
+
+        try {
+            $connection->reconnectIfFail(static function () use (&$callCount) {
+                ++$callCount;
+
+                throw new ConnectionException(new Exception('Connection lost', null, 7), null);
+            });
+            $this->fail('Expected ConnectionException was not thrown');
+        } catch (ConnectionException $e) {
+            $this->assertSame(3, $callCount); // honors configured max_retries
+        }
+    }
+
+    private function createConnectionMockWithCloseSpy(): ConnectionWrapper&MockObject
+    {
+        $params = ['driver' => 'pdo_sqlite', 'memory' => true];
+        $config = new Configuration();
+        $driver = DriverManager::getConnection($params, $config)->getDriver();
+
+        return $this->getMockBuilder(ConnectionWrapper::class)
+            ->setConstructorArgs([$params, $driver, $config])
+            ->onlyMethods(['close'])
+            ->getMock()
+        ;
     }
 }
