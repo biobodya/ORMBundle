@@ -7,7 +7,6 @@ namespace ORMBundle\Doctrine;
 use Doctrine\DBAL\Cache\QueryCacheProfile;
 use Doctrine\DBAL\Connection;
 use Doctrine\DBAL\Exception\ConnectionException;
-use Doctrine\DBAL\Exception\DriverException;
 use Doctrine\DBAL\Result;
 use ORMBundle\Backoff\BackoffFactoryInterface;
 use ORMBundle\DependencyInjection\DBAL\Configuration;
@@ -68,28 +67,19 @@ trait ReconnectTrait
             function () use ($action) {
                 try {
                     return $action();
-                } catch (DriverException $e) {
-                    if (!$this->isConnectionLost($e)) {
-                        throw $e;
-                    }
-
+                } catch (ConnectionException $e) {
+                    // Only genuine connection losses are retryable. DBAL's driver
+                    // ExceptionConverter already classifies them as ConnectionException
+                    // (SQLSTATE class 08, e.g. 08006 "server closed the connection").
+                    // Every other DriverException (unique/not-null/foreign-key violation,
+                    // undefined column, syntax error, ...) is deterministic and must NOT
+                    // be retried: it propagates unchanged so the real error is surfaced.
                     $this->close();
 
                     throw $e;
                 }
             },
-            [DriverException::class],
+            [ConnectionException::class],
         );
-    }
-
-    private function isConnectionLost(DriverException $e): bool
-    {
-        if ($e instanceof ConnectionException) {
-            return true;
-        }
-
-        $previous = $e->getPrevious();
-
-        return null !== $previous && 7 === $previous->getCode();
     }
 }

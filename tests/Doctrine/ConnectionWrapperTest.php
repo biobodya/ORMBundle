@@ -8,6 +8,7 @@ use Doctrine\DBAL\Driver\PDO\Exception;
 use Doctrine\DBAL\DriverManager;
 use Doctrine\DBAL\Exception\ConnectionException;
 use Doctrine\DBAL\Exception\DriverException;
+use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
 use ORMBundle\DependencyInjection\DBAL\Configuration;
 use ORMBundle\Doctrine\ConnectionWrapper;
 use PHPUnit\Framework\TestCase;
@@ -101,57 +102,69 @@ class ConnectionWrapperTest extends TestCase
         });
     }
 
-    public function testReconnectIfFailRetriesOnDriverExceptionWithCode7(): void
+    public function testReconnectIfFailDoesNotRetryPlainDriverExceptionWithCode7(): void
     {
+        // Every fatal PostgreSQL error carries driver code 7 (PGRES_FATAL_ERROR).
+        // A bare DriverException (not classified as ConnectionException by DBAL) is
+        // deterministic and must be surfaced immediately, without retrying.
         $callCount = 0;
-        $result = $this->connection->reconnectIfFail(static function () use (&$callCount) {
-            ++$callCount;
-            if (1 === $callCount) {
-                $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
+
+        try {
+            $this->connection->reconnectIfFail(static function () use (&$callCount) {
+                ++$callCount;
+                $pdoException = new Exception('SQLSTATE[42703]: Undefined column: 7 ERROR', null, 7);
 
                 throw new DriverException($pdoException, null);
-            }
-
-            return 'success';
-        });
-
-        $this->assertSame('success', $result);
-        $this->assertSame(2, $callCount);
+            });
+            $this->fail('Expected DriverException was not thrown');
+        } catch (DriverException $e) {
+            $this->assertSame(1, $callCount);
+        }
     }
 
-    public function testReconnectIfFailRethrowsDriverExceptionWithCode7AfterMaxRetries(): void
+    public function testReconnectIfFailDoesNotRetryUniqueConstraintViolation(): void
     {
+        // Regression: a unique-constraint violation (driver code 7) previously
+        // triggered a bogus reconnect+retry, which closed the connection, rolled back
+        // the running migration transaction and re-ran the failing statement against a
+        // half-reverted schema, masking the real error with a misleading one.
         $callCount = 0;
 
-        $this->expectException(DriverException::class);
+        try {
+            $this->connection->reconnectIfFail(static function () use (&$callCount) {
+                ++$callCount;
+                $pdoException = new Exception(
+                    'SQLSTATE[23505]: Unique violation: 7 ERROR: could not create unique index',
+                    null,
+                    7,
+                );
 
-        $this->connection->reconnectIfFail(static function () use (&$callCount) {
-            ++$callCount;
-            $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
-
-            throw new DriverException($pdoException, null);
-        });
-
-        $this->assertSame(5, $callCount);
+                throw new UniqueConstraintViolationException($pdoException, null);
+            });
+            $this->fail('Expected UniqueConstraintViolationException was not thrown');
+        } catch (UniqueConstraintViolationException $e) {
+            $this->assertSame(1, $callCount);
+        }
     }
 
     public function testReconnectIfFailDoesNotRetryDriverExceptionWithNonConnectionCode(): void
     {
         $callCount = 0;
 
-        $this->expectException(DriverException::class);
+        try {
+            $this->connection->reconnectIfFail(static function () use (&$callCount) {
+                ++$callCount;
+                $pdoException = new Exception('SQLSTATE[42P01]: Undefined table', null, 0);
 
-        $this->connection->reconnectIfFail(static function () use (&$callCount) {
-            ++$callCount;
-            $pdoException = new Exception('SQLSTATE[42P01]: Undefined table', null, 0);
-
-            throw new DriverException($pdoException, null);
-        });
-
-        $this->assertSame(1, $callCount);
+                throw new DriverException($pdoException, null);
+            });
+            $this->fail('Expected DriverException was not thrown');
+        } catch (DriverException $e) {
+            $this->assertSame(1, $callCount);
+        }
     }
 
-    public function testClosesConnectionOnDriverExceptionWithCode7(): void
+    public function testDoesNotCloseConnectionOnPlainDriverExceptionWithCode7(): void
     {
         $params = ['driver' => 'pdo_sqlite', 'memory' => true];
         $config = new Configuration();
@@ -163,22 +176,20 @@ class ConnectionWrapperTest extends TestCase
             ->getMock()
         ;
 
-        $connection->expects($this->once())
+        $connection->expects($this->never())
             ->method('close')
         ;
 
-        $callCount = 0;
-
-        $connection->reconnectIfFail(static function () use (&$callCount) {
-            ++$callCount;
-            if (1 === $callCount) {
-                $pdoException = new Exception('SQLSTATE[HY000]: General error: 7 no connection to the server', null, 7);
+        try {
+            $connection->reconnectIfFail(static function () {
+                $pdoException = new Exception('SQLSTATE[23505]: Unique violation: 7 ERROR', null, 7);
 
                 throw new DriverException($pdoException, null);
-            }
-
-            return 'success';
-        });
+            });
+            $this->fail('Expected DriverException was not thrown');
+        } catch (DriverException $e) {
+            // expected: no reconnect for a deterministic driver error
+        }
     }
 
     public function testUsesCustomRetryOptions(): void
